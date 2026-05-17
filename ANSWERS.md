@@ -4,6 +4,21 @@ Plain text answers to the brief. Where a claim maps to code in this repo, the
 file path is cited; where an item is proposed but not yet wired up, it is
 explicitly marked "Not implemented".
 
+## Contents
+
+1. [Sandbox topology](#1-sandbox-topology) — one sandbox per app, split across a DB stack and a workload stack
+2. [Databases](#2-databases) — three engines, where the data lives, and why
+3. [Clean state strategy](#3-clean-state-strategy) — per-iteration vs per-session vs per-host resets, caching layers
+4. [Persistent context across iterations](#4-persistent-context-across-iterations) — `--task` flag, `iterations.jsonl`, `/memory` mount
+5. [Build and iteration speed](#5-build-and-iteration-speed) — measured timings + 25-row optimization status table
+6. [Output capture](#6-output-capture) — `result.json` schema, exit-code taxonomy, TRX artifacts
+7. [Multi-tenant isolation](#7-multi-tenant-isolation) — per-project networks + compose project names
+8. [Security boundaries](#8-security-boundaries) — `cap_drop`, `no-new-privileges`, gVisor opt-in, egress
+- [Boundaries of current solution](#boundaries-of-current-solution) — explicit out-of-scope list
+
+For the architectural overview, lifecycle diagrams, and quickstart, see [README.md](README.md).
+
+---
 
 ## 1. Sandbox topology
 
@@ -181,7 +196,7 @@ harness/sandbox.py tasks memory <project> <task-id>
 Wired up in `harness/sandbox.py cmd_run` and the `tasks` subcommand group.
 
 
-## 5. intra
+## 5. Build and iteration speed
 
 Measured wall times for the eshop project (Linux WSL2, Docker Desktop):
 

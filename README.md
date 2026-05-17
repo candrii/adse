@@ -7,6 +7,21 @@ profiles, snapshot-based reset, headless config, structured output.
 > the infrastructure that an AI harness runs inside."
 > — task brief
 
+## Contents
+
+- [Lifecycle stages](#lifecycle-stages) — the four-stage table (Bootstrap / Cold / Warm / Incremental) with measured wall times
+- [Two-stack lifecycle, visually](#two-stack-lifecycle-visually) — session-level flow diagram
+- [What's here](#whats-here) — directory tree of the repo
+- [Quickstart](#quickstart) — fastest path from clean checkout to first warm run
+- [Agent loop — task-scoped iteration](#agent-loop--task-scoped-iteration) — `--task` flag, `iterations.jsonl`, memory dir
+- [How it answers the brief](#how-it-answers-the-brief) — one-row-per-design-consideration mapping
+- [CLI surface](#cli-surface) — `sandbox.py` subcommands
+- [Egress allowlist (caveat)](#egress-allowlist-caveat) — tinyproxy + FQDN allowlist, why it's advisory
+- [How I used AI on this exercise](#how-i-used-ai-on-this-exercise) — including the orchestration-tier pullback
+- [Limitations](#limitations) — known caveats, including the medplum acceleration finding
+
+For the long-form answers to the brief's 8 design considerations, see [ANSWERS.md](ANSWERS.md).
+
 ---
 
 ## Lifecycle stages
