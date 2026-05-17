@@ -405,5 +405,13 @@ Agent interface limitations:
   the only entry point.
 - No feedback hooks back to the agent runtime. Substrate emits result.json
   and exits; the harness decides what to do with the result.
-- medplum project is scaffolded (Dockerfile + runner.sh + compose) but
-  not validated end-to-end. eshop is the working path.
+- medplum project is validated end-to-end. Narrow-filter iteration
+  (jest `--testPathPatterns=healthcheck`, 4 tests): ~14s wall / ~7s
+  in-container. Full suite (3364 tests / 221 files): ~1m28s wall;
+  3237 pass, 127 fail. The 127 failures are medplum-specific config
+  mismatches (Redis password expectations, medplum_test_readonly role
+  grants, a few env-config edge cases) — not infrastructure failures.
+  Postgres `:warm` carries the seeded schema via the `PGDATA`-off-`VOLUME`
+  pattern (Q2), so subsequent `db-up` skips the ~90s seed step. See
+  README "Limitations" → medplum bullet for the speedup-attribution
+  detail (DB-I/O-bound before, CPU-cap-secondary after).
