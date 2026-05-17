@@ -3,10 +3,6 @@
 Docker-based sandbox runtime for AI coding agents. Per-project Compose
 profiles, snapshot-based reset, headless config, structured output.
 
-> "we're not asking you to build an AI harness. We're asking you to build
-> the infrastructure that an AI harness runs inside."
-> — task brief
-
 ## Contents
 
 - [Lifecycle stages](#lifecycle-stages) — the four-stage table (Bootstrap / Cold / Warm / Incremental) with measured wall times
@@ -207,12 +203,6 @@ is disabled. For enforced egress: k8s `CiliumNetworkPolicy` with
 **What AI got right.** Dockerfile + compose + bash scaffolding (saved hours). Discovering eShopOnWeb specifics via `gh api`: .NET 10 (not 9), two DbContexts (`CatalogContext` + `AppIdentityDbContext`), the actual health-check paths (`/home_page_health_check`, `/api_health_check`). Catching the WSL2 / Docker Desktop bind-mount permission quirk. Debugging the silent exit-code bug where `execd` emits `execution_complete` for success but `error` for failures.
 
 **Course correction.** The biggest one: AI happily designed an entire orchestration tier (Temporal + a Runtime Manager service + LangGraph + OpenSandbox) before I asked an independent reviewer to read the brief. The reviewer's critique:
-
-> *"You've designed the top of the stack (workflow coordination) and skipped the middle (isolation, state reset, output capture, resource model, DB strategy) which is where the brief actually grades you. Cut Temporal, justify or drop OpenSandbox by name, and put the design weight on snapshotting, per-project compose profiles, and isolation primitives."*
-
-Correct. The brief literally says *"we're not asking you to build an AI harness"* and AI built a harness anyway. I demolished ~600 LoC of orchestration code, parked it in `docs/out-of-scope/` with a write-up of why, and rebuilt around per-project compose profiles + `docker commit` snapshot reset + a thin CLI.
-
-The pull-back was the most useful step in the project. It's a real example of the failure mode the role description hints at: agents tend to over-engineer the most-visible architectural layer rather than the one that's actually graded. Catching that requires either a sharp reviewer or a checklist; raw "more AI" doesn't help.
 
 **Things I'd do differently.** Read the brief into the conversation *as a constraint document* before letting AI propose architecture. Validate Medplum in lockstep with eShop. Bake demo evidence into the Makefile from day 1.
 
