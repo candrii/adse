@@ -1,334 +1,221 @@
 # Headless Agent Sandbox
 
 Docker-based sandbox runtime for AI coding agents. Per-project Compose
-profiles, snapshot-based reset, headless config, structured output, gVisor
-opt-in. This is the **substrate** — not the harness, not the orchestrator.
+profiles, snapshot-based reset, headless config, structured output.
 
 > "we're not asking you to build an AI harness. We're asking you to build
 > the infrastructure that an AI harness runs inside."
 > — task brief
 
+---
+
+## Lifecycle stages
+
+Five stages, distinguished by **when they happen**, **what's reused**, and
+**what the agent sees**. Measurements are from the eshop project on this
+machine (Linux 6.6 WSL2, Docker Desktop, .NET 10 SDK).
+
+| Stage | When | Starts from | DB state | What the agent sees | Wall time | In-container |
+|---|---|---|---|---|---|---|
+| **Bootstrap** | Once per host (or after image change) | Empty Docker host | n/a — no DB yet | n/a — no sandbox running | minutes (image build, base SDK pull, NuGet warm) | n/a |
+| **Cold** | First task on a fresh host, or after `make nuke` | Bootstrapped `:latest` images for both DB + workload | Empty — every EF migration runs against empty databases | Repo baked into image, no prior work | **70s** | 51s |
+| **Warm start** | Per *session* (first agent iteration), after `make warmup` has committed `:warm` snapshots | `:warm` images (compiled `bin/obj`, NuGet cache, migrated DB schema) | Schema already applied | Same baked repo + pre-built artifacts | **51s** | 35s |
+| **Warm + DB up, full suite** | Iterations 2..N, all 113 tests | DB still up, workload restarts from `:warm` | Schema applied | Workload restarts, DB stays warm; migrate skipped via `__EFMigrationsHistory` row count vs source migration count; app_start removed (eShop tests use `WebApplicationFactory`) | **29s** | **22s** |
+| **Warm + DB up, narrow filter** *(agent-loop hot path)* | Same, but with `--filter "FullyQualifiedName~ClassName"` to scope tests | Same | Same | Test stage drops from 17s (113 tests) to 3s (2 tests in one class) | **16s** | **9s** |
+| **Incremental** | Same as Warm + DB up but with `--source` overlay | `:warm` workload + agent's modified files rsync'd over the warm tree (preserving `bin/obj/.git`) | Schema applied | Agent's edits on top of warm tree; `dotnet build` only recompiles changed files | **~30s** unchanged content, **~38s** with a 1-file edit | ~22-30s |
+
+The bright lines:
+
+- **Bootstrap vs Cold** — bootstrap is `docker build` (produces an image); cold is `docker compose up` (produces a sandbox). Bootstrap amortizes across every cold run that follows.
+- **Cold vs Warm** — both start a fresh sandbox; warm has pre-paid restore + build + migrate via `docker commit`. The DB's writable layer carries the migrated schema; the workload's writable layer carries `bin/obj`. Same isolation guarantee — full `down -v` between sessions.
+- **Warm vs Warm + DB up** — the DB stack now has its own compose file ([compose/databases/eshop.yml](compose/databases/eshop.yml)) and its own compose project. The workload compose joins the DB's network as `external: true`. The CLI tears down only the workload between iterations; the DB stays up. Saves ~8s per iteration (SQL Server boot + healthcheck wait).
+- **Warm + DB up vs Incremental** — the warm path replaces `/workspace/repo` with the baked source on every iteration (no carryover between agent edits). Incremental overlays the agent's host-side edits on top of the warm tree via `rsync --exclude='bin/' --exclude='obj/' --exclude='.git/'`, so the compiler reuses the warm `obj/` cache. `.git` is preserved — we never stomp the baked repo's history.
+
+How it maps to the brief's design considerations:
+
+- **Q3 (clean state — reset/rebuild without starting from scratch)** spans **Cold → Warm**: the warm snapshot is the *checkpoint to rewind to*. Schema-applied, NuGet-warm, build-warm. Reset for a full session = `make destroy` + `make db-up`; reset between iterations = automatic workload teardown via `compose down -v`.
+- **Q5 (build performance / startup time strategy)** is the whole tiered story above. Headline numbers for the agent loop: **70s cold → 29s full-suite warm → 16s narrow-filter warm** (in-container work: **9s**, the rest is compose container create/destroy overhead). Hitting wall-time below 13s would require keeping the workload container persistent across iterations; deliberately rejected because it weakens per-iteration isolation (see ANSWERS.md Q5 table, "Persistent workload container" row).
+
+## Two-stack lifecycle, visually
+
+```
+session start ─→ make db-up                                           (DB cold-starts once, ~6s)
+                  │
+                  ├──→ make run-test                                  (full suite, 113 tests)         29s
+                  ├──→ sandbox run eshop test --filter "..."          (narrow, 1 test class)          16s
+                  ├──→ make run-task TASK=fix SOURCE=~/work/eshop     (incremental, with overlay)     ~30s
+                  ⋮
+session end   ─→ make destroy                                         (workload + DB both torn down)
+```
+
+The DB compose project (`ai-harness-eshop-db`) and the workload compose
+project (`ai-harness-eshop`) have independent lifecycles. The workload
+joins the DB's network (`ai-harness-eshop-net`) as `external: true`.
+
+---
+
+> ⚠️ Below this point the document is the previous README content,
+> updated for the two-stack lifecycle. Sections likely to consolidate
+> or trim on review: Quickstart, CLI surface, How I used AI.
+
+---
+
 ## What's here
 
 ```
-ai-harness/
+adse/
 ├── compose/
-│   ├── eshop.yml          # SQL Server + eShop sandbox, isolated network
-│   └── medplum.yml        # Postgres + Redis + Medplum sandbox, isolated network
+│   ├── databases/
+│   │   ├── eshop.yml                       # SQL Server (compose project: ai-harness-eshop-db)
+│   │   ├── medplum.yml                     # Postgres + Redis (compose project: ai-harness-medplum-db)
+│   │   └── medplum-postgres-init.sql       # provisions medplum_test DB + readonly role
+│   ├── eshop.yml                           # eshop workload + egress-proxy, joins eshop DB's network as external
+│   └── medplum.yml                         # medplum workload + egress-proxy, joins medplum DB's network as external
+├── checkouts/                              # host-side source clones (gitignored)
+│   ├── eshop/                              # github.com/NimblePros/eShopOnWeb (.NET 10)
+│   └── medplum/                            # github.com/medplum/medplum (Node 22, npm monorepo)
 ├── images/
-│   ├── eshop/             # .NET 10 SDK + warm NuGet + runner.sh
-│   └── medplum/           # Node 20 + pnpm + runner.sh (scaffold)
+│   ├── eshop/
+│   │   ├── Dockerfile                      # .NET 10 SDK + warm NuGet + dotnet-ef
+│   │   ├── runner.sh                       # subcommand CLI: build/warmup/test/all; skip-migrate-when-current
+│   │   ├── healthcheck.sh
+│   │   └── dockerignore.template           # deposited at checkouts/eshop/.dockerignore at build time
+│   ├── medplum/
+│   │   ├── Dockerfile                      # Node 22 + npm + warm node_modules (monorepo)
+│   │   ├── runner.sh                       # subcommand CLI; skip-seed-when-current; jest --testPathPatterns
+│   │   ├── healthcheck.sh
+│   │   └── dockerignore.template
+│   └── medplum_tests_acceleration.png      # CPU graph: capped vs uncapped jest
 ├── harness/
-│   └── sandbox.py         # thin CLI over `docker compose` + `docker commit`
-├── egress-proxy/          # tinyproxy + FQDN allowlist (network boundary)
-├── scripts/
-│   ├── install-gvisor.sh  # host-side gVisor install (kernel isolation)
-│   └── verify-gvisor.sh
-├── Makefile               # ergonomic wrappers
+│   └── sandbox.py                          # thin CLI over docker buildx + docker compose + docker commit
+├── egress-proxy/                           # tinyproxy + FQDN allowlist (advisory; see Egress section)
+├── scripts/                                # install-gvisor.sh, verify-gvisor.sh
+├── out/                                    # per-run results, gitignored
+│   ├── _placeholder/                       # bind-mount defaults (empty dir + per-run results dirs)
+│   └── <project>/<task-id>/<run-id>/       # run-id format: 2026-05-17T01-14-53-test-434b1e
+├── Makefile                                # ergonomic wrappers around harness/sandbox.py
+├── README.md                               # (this file) lifecycle, optimization story, demo flow
+├── ANSWERS.md                              # written answers to the brief's 8 design considerations
 └── docs/
-    ├── *.pdf, TASK_TEXT.md    # the brief
-    └── out-of-scope/          # orchestration explorations pulled back per the brief
+    ├── TASK_TEXT.md, *.pdf                 # the brief
+    └── out-of-scope/                       # earlier orchestration explorations pulled back per the brief
 ```
 
-There is no top-level `docker-compose.yml`. Per-project profiles are the
-unit of isolation.
+No top-level `docker-compose.yml`. Per-project profiles are the unit of isolation; each project is further split into a long-lived DB stack and an ephemeral workload stack with independent lifecycles.
 
 ## Quickstart
 
 ```bash
 make bootstrap                      # write .env (DB passwords)
-make build PROJECT=eshop            # docker build the sandbox image
-make warmup PROJECT=eshop           # cold-start once, commit :warm baselines
-make run-test PROJECT=eshop         # restore from :warm, run tests, write result.json
-cat out/eshop/<run-id>/result.json
+make build PROJECT=eshop            # auto-clones source to checkouts/eshop/,
+                                    # then docker buildx build :latest
+make warmup PROJECT=eshop           # cold-up DB + workload, commit :warm
+make db-up PROJECT=eshop            # start the long-lived DB stack
+make run-test PROJECT=eshop         # warm workload run; DB stays up
+make run-test PROJECT=eshop         # next iteration; ~42s
+make destroy PROJECT=eshop          # tear down everything (DB + workload)
+
+# Update source without rebuilding the image:
+make refresh-source PROJECT=eshop   # git fetch + reset --hard on checkouts/
+# Source changes can be applied at run time via --source instead — no rebuild
 ```
 
-Output lands in `./out/<project>/<run-id>/` — a JSON result, per-stage
-logs, and any test artifacts the workload emitted.
-
-## The agent loop — task-scoped iteration
-
-A headless agent rarely runs once. It tries a change, reads results,
-reasons, tries another change, and repeats until the task is done. The
-substrate provides this loop:
+## Agent loop — task-scoped iteration
 
 ```bash
-# Agent picks a task identifier and (optionally) a host source directory
-# to mount. Edits source on the host between runs — no image rebuild.
-
+make db-up PROJECT=eshop                                          # once per session
 make run-task PROJECT=eshop TASK=fix-health-endpoint SOURCE=~/work/eshop
-# ↑ first iteration: copies host source into sandbox, builds, tests,
-#   appends to out/eshop/fix-health-endpoint/iterations.jsonl
-
-# Agent reads results, reasons, makes a fix:
-vim ~/work/eshop/src/Web/Program.cs
-echo "iter-1: removed early registration of MapHealthChecks" \
-  >> $(make tasks-memory TASK=fix-health-endpoint)/notes.md
-
-# Next iteration — same task, persistent memory:
-make run-task PROJECT=eshop TASK=fix-health-endpoint SOURCE=~/work/eshop
-
-# Inspect:
-make tasks-ls                                    # all tasks across projects
-make tasks-show TASK=fix-health-endpoint         # iteration history
+# vim ~/work/eshop/src/Web/Program.cs
+make run-task PROJECT=eshop TASK=fix-health-endpoint SOURCE=~/work/eshop  # incremental
+make tasks-show PROJECT=eshop TASK=fix-health-endpoint            # iteration history
+make destroy PROJECT=eshop                                        # end of session
 ```
 
-What's provided by the substrate (not the agent):
+Substrate-provided (not the agent):
 
 | Mechanism | Purpose | Lifecycle |
 |---|---|---|
-| `--task <id>` flag | Names a task; scopes results | per agent reasoning loop |
-| `out/<project>/<task>/iterations.jsonl` | Append-only iteration log | persists across `down -v` |
-| `out/<project>/<task>/<run_id>/` | Full per-iteration artifacts (result.json, logs, .trx) | persists |
-| `out/<project>/<task>/memory/` | Agent-writable scratchpad, mounted as `/memory` inside sandbox | persists |
-| `--source <dir>` flag | Host source override; bind-mounted read-only at `/workspace/src` | per iteration |
+| `--task <id>` | Scopes results; enables iteration log + memory dir | per agent reasoning loop |
+| `out/<project>/<task>/iterations.jsonl` | Append-only iteration log (records `db_was_up` per row) | persists across `down -v` |
+| `out/<project>/<task>/<run_id>/` | Per-iteration artifacts; `run_id` format is `YYYY-MM-DDTHH-MM-SS-<stage>-<6hex>` so directories sort chronologically and read at a glance | persists |
+| `out/<project>/<task>/memory/` | Agent-writable scratchpad, mounted as `/memory` | persists |
+| `--source <dir>` | Host source override; rsync'd onto `/workspace/repo` | per iteration |
 
-What's **not** provided:
-
-- The agent's LLM context, prompts, reasoning. That's the harness's job
-  — Claude memory tool, LangGraph checkpointer, whatever it uses.
-- Cross-task memory. Each task is a namespace; tasks are isolated.
-
-### Substrate result contract
-
-Each iteration produces a result.json that surfaces the task identifier
-and memory mount, so the agent can introspect from inside the sandbox:
-
-```json
-{
-  "task_id":         "fix-health-endpoint",
-  "run_id":          "r1778972422-d49319",
-  "project":         "eshop",
-  "stage":           "test",
-  "status":          "pass",
-  "exit_code":       0,
-  "memory_dir":      "/memory",
-  "source_override": true,
-  "duration_s":      54,
-  "stages":          { ... },
-  "artifacts":       [ ... ]
-}
-```
+Not provided: the agent's LLM context / prompts / reasoning, cross-task memory.
 
 ## How it answers the brief
 
-| Brief topic | This repo's answer |
+| Topic | Answer |
 |---|---|
-| **DB conflict (SQL Server vs Postgres + Redis)** | Per-project Compose profiles. `eshop.yml` brings only SQL Server; `medplum.yml` brings Postgres + Redis. Unique network namespace per project (`ai-harness-eshop-net` / `ai-harness-medplum-net`) — zero cross-talk. |
-| **Clean state strategy** | `docker commit` of warm baselines after one cold prep run. `sandbox warmup eshop` does the slow stuff (NuGet restore, dotnet build, EF migrate) once, then commits sqlserver + eshop as `:warm`. Subsequent `sandbox run` restores from those — sub-2s. `down -v` between runs wipes any in-run state (tmpfs data volumes). |
-| **Headless execution** | `ACCEPT_EULA=Y` for SQL Server in compose env; `DOTNET_NOLOGO`, `DOTNET_CLI_TELEMETRY_OPTOUT` in image. No CLI prompts; everything passes through env. |
-| **Output capture as structured data** | `runner.sh` writes `/results/result.json` with stable shape: `{run_id, project, stage, status, exit_code, duration_s, stages: {name: {ok, duration_s, log}}, artifacts: [...]}`. Bind-mounted to `./out/<project>/<run-id>/` on host. Stable exit codes: 0=pass, 10=build_fail, 20=test_fail, 30=migrate_fail, 40=health_fail, 70=patch_fail, 80=checkout_fail. |
-| **Isolation model** | (1) `cap_drop` of the dangerous Linux caps (NET_ADMIN, NET_RAW, SYS_ADMIN, SYS_MODULE, SYS_PTRACE, SYS_TIME, MKNOD, AUDIT_WRITE, SYS_TTY_CONFIG) + `no-new-privileges:true` on the workload service. (2) Per-project network namespace — `ai-harness-eshop-net` and `ai-harness-medplum-net` are unrelated. (3) Egress allowlist: `egress-proxy` runs on each project's network with an FQDN whitelist (github / nuget / npm / mcr / docker hub / cdnjs). **Caveat:** this is an advisory boundary — code that respects `HTTP_PROXY` env vars routes through it, but the container netns has direct outbound. For enforced egress we'd need netns iptables or k8s NetworkPolicy; see "Egress allowlist (caveat)" below. (4) gVisor opt-in path: `runtime: runsc` is a one-line config change once `make install-gvisor` is run on the host. |
-| **Secrets handling** | DB passwords in `.env` (.gitignored). Compose substitutes at startup; runtime containers see them as env vars. **Never** passed on command line, never written to images, never logged. Production path: swap `.env` for a secret-mount via Vault / 1Password / AWS Secrets Manager — `compose/*.yml` already references env-style variables. |
-| **Resource limits & multi-tenancy** | Per-service `deploy.resources.limits` in each compose profile (eshop sqlserver: 4G/2cpu; eshop app: 4G/2cpu; medplum: 4G/2cpu). For parallel runs, pass `-p <unique-name>` to compose via the CLI's `RUN_ID` mechanism — the network is created per project name. |
-| **Build cache** | NuGet warm cache baked into the eshop image at build time (one `dotnet restore` during image build). Same pattern for medplum (`pnpm install --frozen-lockfile` at image build). On warm baselines: `docker commit` after migrate gives a hot DB schema too. BuildKit cache mounts are the next step for the image-rebuild path. |
+| **DB conflict (SQL Server vs Postgres + Redis)** | Per-project compose with independent DB and workload stacks. Unique network namespace per project; zero cross-talk. |
+| **Clean state** | `docker commit` after warmup captures `bin/obj` (workload container) **and** the migrated DB schema (sqlserver container, since `mcr.microsoft.com/mssql/server:2022-latest` declares no `VOLUME`, so `/var/opt/mssql` lives in the container's writable layer and gets snapshotted). Postgres has the opposite — its image *does* declare a VOLUME, so Postgres data lives on tmpfs and is wiped by `down -v`. Workload `down -v` between iterations; DB `down -v` only on `make destroy`. |
+| **Headless execution** | `ACCEPT_EULA=Y`, `DOTNET_NOLOGO`, `DOTNET_CLI_TELEMETRY_OPTOUT`. No CLI prompts; everything via env. |
+| **Output capture** | `runner.sh` writes `/results/result.json` with `{run_id, project, stage, status, exit_code, duration_s, stages: {name: {ok, duration_s, log}}, artifacts}`. Stable exit codes: 0=pass, 10=build_fail, 20=test_fail, 30=migrate_fail, 40=health_fail, 50=timeout, 60=infra, 70=patch_fail, 80=checkout_fail. |
+| **Isolation** | `cap_drop` of dangerous caps (NET_ADMIN, NET_RAW, SYS_ADMIN, SYS_MODULE, SYS_PTRACE, SYS_TIME, MKNOD, AUDIT_WRITE, SYS_TTY_CONFIG) + `no-new-privileges:true`. Per-project network namespace. gVisor opt-in via `runtime: runsc`. |
+| **Secrets** | DB passwords in `.env` (gitignored), substituted at compose-up. Never in code, never in images, never logged. Production swap: Vault / 1Password / AWS Secrets Manager. |
+| **Resource limits** | Currently unconstrained — `deploy.resources.limits` removed during optimization (single-threaded jest transpile + babel was the bottleneck, not CPU caps). Easy to re-add per-service if multi-tenant noisy-neighbor pressure appears. |
+| **Build cache** | NuGet baked into `:latest`; bin/obj + DB schema baked into `:warm` via `docker commit`. Incremental `dotnet build` via `--source` rsync overlay. Independent DB lifecycle so SQL Server boot cost is amortized across the session. |
 
 ## CLI surface
 
 ```
-sandbox build    <project>                  docker build the image
-sandbox warmup   <project>                  cold-up → prep stages → docker commit :warm tags
-sandbox run      <project> <stage>          full lifecycle: up → exec runner.sh <stage> → down
+sandbox fetch-source <project>              clone upstream repo to checkouts/<project>/
+                                            --refresh  git fetch + reset --hard
+sandbox build    <project>                  docker buildx build (auto-clones source if missing)
+sandbox warmup   <project>                  cold-up DB + workload, commit :warm tags
+sandbox db-up    <project>                  bring up the DB stack (no-op if up)
+sandbox db-down  <project>                  tear down DB stack
+sandbox run      <project> <stage>          ensure DB up -> workload up -> exec runner.sh -> workload down
                                             <stage> ∈ build | test | all
                                             --snapshot warm|cold (default: warm)
-sandbox exec     <project> -- <cmd>...      ad-hoc shell into the running sandbox
-sandbox destroy  <project>                  compose down -v
-sandbox ps       <project>                  compose ps
-sandbox logs     <project> [svc]            compose logs
+                                            --task <id>      scope to a task (persistent memory)
+                                            --source <dir>   host source override (incremental builds)
+                                            --filter <expr>  dotnet test --filter expression (narrow test scope)
+sandbox exec     <project> -- <cmd>...      ad-hoc exec into the running sandbox
+sandbox destroy  <project>                  tear down workload AND DB
+sandbox tasks    ls | show | memory         introspect iteration history
 ```
-
-This is what a CI runner, an AI harness, or a developer would call. It
-deliberately doesn't expose a stateful service — `docker compose` is the
-state. If you need a long-lived queue/orchestrator above this, build it as
-your harness; treat this as the substrate.
-
-## Lifecycle in one diagram
-
-```
-                                  ┌──────────────────────────────┐
-                                  │  Caller (CI, AI harness,     │
-                                  │   developer at terminal)     │
-                                  └──────────────┬───────────────┘
-                                                 │  sandbox <cmd>
-                                                 ▼
-                                  ┌──────────────────────────────┐
-                                  │  harness/sandbox.py          │
-                                  │  thin CLI: ~250 lines        │
-                                  └──────────────┬───────────────┘
-                                                 │  docker compose -f
-                                                 ▼
-   ╭─────────────────────────────────────────────────────────────────────╮
-   │  compose/eshop.yml          OR        compose/medplum.yml           │
-   │  ┌──────────────┐                     ┌──────────────┐ ┌──────────┐ │
-   │  │  sqlserver   │                     │   postgres   │ │  redis   │ │
-   │  └──────────────┘                     └──────────────┘ └──────────┘ │
-   │  ┌──────────────┐                     ┌──────────────┐              │
-   │  │    eshop     │                     │   medplum    │              │
-   │  │  (workload)  │                     │  (workload)  │              │
-   │  └──────────────┘                     └──────────────┘              │
-   │  ai-harness-eshop-net                  ai-harness-medplum-net       │
-   ╰─────────────────────────────────────────────────────────────────────╯
-                       │                                  │
-                       └──────────────┬───────────────────┘
-                                      │  egress: HTTP_PROXY
-                                      ▼
-                          ┌────────────────────────┐
-                          │  egress-proxy          │
-                          │  tinyproxy + allowlist │
-                          └─────────┬──────────────┘
-                                    ▼
-                              github / nuget / npm / mcr
-```
-
-Reset between runs is `docker compose down -v` (volumes wiped — data was on
-tmpfs, so this is sub-second). Restart from warm baseline is `docker compose
-up` with the `:warm` image tag substituted in via env var — typically
-under 5 seconds for the whole stack to be healthy.
-
-## Demo script
-
-```bash
-# 1. bootstrap
-make bootstrap                       # ~1s; writes .env
-
-# 2. build the eshop sandbox image (slow, one-time: pulls .NET SDK + restores NuGet)
-make build PROJECT=eshop             # ~3–5 min cold; subsequent runs cached
-
-# 3. warm baseline (slow, one-time: cold-up + migrate + commit)
-make warmup PROJECT=eshop            # ~60–90s; the only run that pays full startup cost
-
-# 4. test runs against the warm baseline — this is what an agent harness would do
-time make run-test PROJECT=eshop     # target: ~25–30s total
-cat out/eshop/*/result.json          # structured result, per-stage timing
-
-# 5. another test run, no cleanup needed (the previous one already torn itself down)
-time make run-test PROJECT=eshop     # demonstrates repeatability + reset
-```
-
-## What's deliberately out of scope
-
-- **Orchestration above the sandbox** (queue, workflow engine, MCP server,
-  Temporal). Earlier explorations parked under `docs/out-of-scope/` —
-  with notes on why we pulled them back.
-- **The agent itself** (LLM loop, tool dispatching, prompt engineering).
-  That's the consumer of this runtime.
-- **Production k8s migration**. Same images and runner.sh work as-is; need
-  manifests + NetworkPolicy + RuntimeClass. Notes in the gVisor scripts.
 
 ## Egress allowlist (caveat)
 
-The `egress-proxy/` directory ships a tinyproxy + FQDN allowlist
-(`allowlist.txt`). `compose/eshop.yml` and `compose/medplum.yml` declare
-it as a service on each project's network. **But:**
-
-- The proxy is *advisory*. Code that honors the `HTTP_PROXY` /
-  `HTTPS_PROXY` env vars routes through it; code that opens raw sockets
-  to an IP doesn't. The container's network namespace has direct
-  outbound on this host.
-- We tried setting `HTTP_PROXY` on the workload service and discovered
-  it broke .NET's LibMan HTTPS-via-proxy negotiation (LIB002 even with
-  cdnjs allowlisted and `curl -x` working manually). Rather than ship
-  a half-working setup, we removed the env-var injection and documented
-  the gap honestly.
-
-What this means in practice:
-- The proxy is useful as a **build-time** dependency mirror (a deliberate
-  caller can route through it).
-- It is **not** a runtime sandbox-escape boundary.
-
-To make egress actually enforced, the production path is:
-- **k8s**: a `CiliumNetworkPolicy` with `toFQDNs` allowlist on the
-  workload pod. Same allowlist; kernel-enforced.
-- **Same-host Docker**: `iptables` in the container's netns + a custom
-  network plugin, or run the workload behind a `NetworkPolicy`-style
-  service mesh (Istio etc.).
-- **gVisor + Cilium** is the combination Anthropic Managed Agents and
-  e2b's hosted runtime both use.
-
-This is honest about an active limitation rather than a false claim of
-filtered egress.
+`egress-proxy/` ships tinyproxy + FQDN allowlist. **Advisory only** — only
+code that honors `HTTP_PROXY` / `HTTPS_PROXY` routes through it; the
+container netns has direct outbound. Setting `HTTP_PROXY` on the workload
+broke .NET LibMan HTTPS-via-proxy negotiation, so the env-var injection
+is disabled. For enforced egress: k8s `CiliumNetworkPolicy` with
+`toFQDNs` allowlist, or netns iptables rules.
 
 ## How I used AI on this exercise
 
-The brief asks. Honest write-up:
+**Tools.** Claude Code as the primary pair; one fresh-instance Claude Sonnet review at the critical junction described below.
 
-**Tools.** Claude Code as the primary pair; a fresh Claude Sonnet review
-as a sanity check at one critical junction (see "course correction" below).
+**What AI got right.** Dockerfile + compose + bash scaffolding (saved hours). Discovering eShopOnWeb specifics via `gh api`: .NET 10 (not 9), two DbContexts (`CatalogContext` + `AppIdentityDbContext`), the actual health-check paths (`/home_page_health_check`, `/api_health_check`). Catching the WSL2 / Docker Desktop bind-mount permission quirk. Debugging the silent exit-code bug where `execd` emits `execution_complete` for success but `error` for failures.
 
-**What AI got right.**
-- Boilerplate at the byte level — Dockerfiles, compose YAML, argparse
-  CLI scaffolding, bash plumbing in `runner.sh`. Saved hours.
-- Surfacing the eShopOnWeb specifics quickly: `gh api` queries to
-  discover the `.NET 10` (not 9!) target, the two DbContexts
-  (`CatalogContext` + `AppIdentityDbContext`), the actual health-check
-  endpoint paths (`/home_page_health_check`, not `/health`).
-- Recognizing when the WSL2 / Docker Desktop bind-mount permission
-  quirk was eating us. The diagnostic loops were AI-driven.
-- Debugging the silent exit-code bug: when `execd` reported
-  `execution_complete` for success but `error` for failures, our parser
-  defaulted to 0 on the wrong event type. AI noticed the discrepancy
-  by probing the protocol directly.
+**Course correction.** The biggest one: AI happily designed an entire orchestration tier (Temporal + a Runtime Manager service + LangGraph + OpenSandbox) before I asked an independent reviewer to read the brief. The reviewer's critique:
 
-**Where AI went wrong (and where I had to intervene).**
-The single biggest course-correction: AI happily designed an entire
-orchestration tier (Temporal + a Runtime Manager service + LangGraph +
-OpenSandbox) before I asked an independent reviewer to read the brief.
-The reviewer's critique:
+> *"You've designed the top of the stack (workflow coordination) and skipped the middle (isolation, state reset, output capture, resource model, DB strategy) which is where the brief actually grades you. Cut Temporal, justify or drop OpenSandbox by name, and put the design weight on snapshotting, per-project compose profiles, and isolation primitives."*
 
-> *"You've designed the top of the stack (workflow coordination) and
-> skipped the middle (isolation, state reset, output capture, resource
-> model, DB strategy) which is where the brief actually grades you. Cut
-> Temporal, justify or drop OpenSandbox by name, and put the design
-> weight on snapshotting, per-project compose profiles, and isolation
-> primitives."*
+Correct. The brief literally says *"we're not asking you to build an AI harness"* and AI built a harness anyway. I demolished ~600 LoC of orchestration code, parked it in `docs/out-of-scope/` with a write-up of why, and rebuilt around per-project compose profiles + `docker commit` snapshot reset + a thin CLI.
 
-That was correct. The brief literally says *"we're not asking you to
-build an AI harness"* and AI built a harness anyway. I demolished
-~600 LoC of orchestration code, parked it in `docs/out-of-scope/` with
-a write-up of why, and rebuilt around per-project compose profiles +
-`docker commit` snapshot reset + a thin CLI.
+The pull-back was the most useful step in the project. It's a real example of the failure mode the role description hints at: agents tend to over-engineer the most-visible architectural layer rather than the one that's actually graded. Catching that requires either a sharp reviewer or a checklist; raw "more AI" doesn't help.
 
-The pull-back was the most useful step in the project. It's a real
-example of the failure mode the role description hints at: agents tend
-to over-engineer the most-visible architectural layer rather than the
-one that's actually graded. Catching that requires either a sharp
-reviewer or a checklist; raw "more AI" doesn't help.
+**Things I'd do differently.** Read the brief into the conversation *as a constraint document* before letting AI propose architecture. Validate Medplum in lockstep with eShop. Bake demo evidence into the Makefile from day 1.
 
-**Things I'd do differently next time.**
-- Read the brief into the conversation *as a constraint document*
-  before letting AI propose architecture. Forcing AI to map each design
-  decision onto a brief criterion would have caught the over-scoping
-  earlier.
-- Validate the second project (Medplum) in lockstep with the first
-  rather than at the end. We have one project working end-to-end
-  (eShop) and one scaffolded (Medplum); a side-by-side build would
-  have surfaced cross-cutting issues (e.g. uid mismatches on bind
-  mounts) once, not twice.
-- Bake a "demo evidence" target into the Makefile from day 1
-  (screenshots, recorded asciicast). We have working CLI invocations
-  but no curated evidence — the panel can run it but can't *see* it
-  before they do.
+## Limitations
 
-This whole exercise — using an agent to build the substrate that
-agents will run inside — was the most useful prompt for the role. The
-specific things that went wrong are the things the substrate needs to
-help future agents avoid.
+- **Image size** (eshop: ~5.4 GB). Driven by .NET 10 SDK. Could shrink with multi-stage builds for pure runtime images, but the agent runs `dotnet test` inside — SDK has to be in.
+- **Single host.** CLI calls local `docker`. For fleets: `DOCKER_HOST` or move to k8s.
+- **Sequential default.** One run per project at a time. Parallel runs need unique compose project names.
+- **medplum**: validated end-to-end. Narrow-filter test iteration: **~14s wall / ~7s in-container** (4 healthcheck tests). Full suite: **~1m28s wall** (3237/3364 tests pass; remaining 127 are medplum-specific Redis-password / role-grant config issues, not infrastructure).
 
-## Limitations + things to know
+  **What drove the 17min → 1m28s drop (≈12× speedup) is the combination of two independent optimizations** — neither alone gets the same number:
 
-- **Image size** (eshop: ~5.4 GB). Driven by the .NET 10 SDK + Blazor +
-  test framework NuGet packages. Could shrink with multi-stage builds for
-  pure runtime images, but the brief calls for an *agent* sandbox where
-  the agent runs `dotnet test` etc. inside — so the SDK has to be in.
-- **Single host**. The CLI calls `docker` locally. For multi-host fleets,
-  point it at a remote Docker daemon (`DOCKER_HOST`) or move to k8s.
-- **Sequential default** (one run per project at a time). Parallel runs
-  require unique compose project names; the CLI has a hook for that
-  (`RUN_ID` is exported to compose) but the demo flow is one-at-a-time.
-- **medplum**: Dockerfile + runner.sh scaffolded but not validated
-  end-to-end (eshop was the working path).
-- **Container runs as root** in WSL2 because Docker Desktop doesn't
-  propagate host bind-mount permissions into the container's user
-  namespace. Mitigated by `cap_drop: [ALL]` + `no-new-privileges`, the
-  per-project network namespace, and the egress allowlist. On native
-  Linux you can drop back to uid 1001.
+  1. **Postgres `:warm` pattern** — `seed.test.ts` runs ONCE at `warmup`, populates `medplum_test` with ~600 MB of schema + fixtures, and that state is captured into the `:warm` image via the `PGDATA`-off-`VOLUME` trick (see ANSWERS Q2). Every subsequent `db-up` starts already-seeded in ~4s. This is the same idea as a "ramdisk DB that survives restarts" — the seeded state lives in the image (which is essentially baked, immutable RAM at runtime) instead of being re-built on every container start. Without it, every full-suite run pays ~60–90s of seed cost again.
+  2. **Removing the `cpus: "2"` cap** — medplum's tests are babel-jest-bound (single-threaded TS transpilation per worker). Capped at 2 cores, jest could only spawn ~2 workers and the host sat at ~12% CPU. Uncapped, jest fans out across the 16 cores and the test stage's wall time drops from ~17 min to ~80s.
+
+  ![medplum tests acceleration: CPU flat at ~12% with cap, then saturates after removing the cap](images/medplum_tests_acceleration.png)
+
+  *Host CPU during medplum's full test suite. Left: capped at `cpus: "2"`, jest pinned at ~12% of the 16-core host (one container fully saturating its 2-core allocation). Right: cap removed, jest fans out across cores. The `:warm` Postgres ensures the seed cost is paid once per session, not once per iteration.*
+- **Container runs as root on WSL2** due to Docker Desktop's bind-mount perm quirk. Mitigated by `cap_drop` + `no-new-privileges` + per-project netns + (optional) gVisor. On native Linux, drop to uid 1001.
+- **`/memory` and `/workspace/src` are pre-created as directories in the image** to avoid a Docker Desktop WSL2 cache-poisoning issue: if `docker commit` runs while those paths are bind-mounted to `/dev/null`, the warm image bakes them as zero-byte files, and subsequent runs that try to bind a real directory there fail with `not a directory` at OCI init. Pinning the rootfs entry type avoids it.
+- **DB state leaks between iterations.** With the independent DB lifecycle, schema is reset only on `make destroy`. Tests that mutate state may see prior iteration's data. Mitigation: tests should clean up (eShop's xUnit tests are mostly idempotent), or `make db-down && make db-up` between iterations (loses the DB-warm speedup).

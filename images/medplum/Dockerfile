@@ -2,48 +2,60 @@
 #
 # Medplum sandbox image.
 #
-# Strategy: same shape as eshop — clone at build time, warm the pnpm store
-# into a baked layer, then let the runner re-checkout + patch at task time.
-# pnpm with `--frozen-lockfile` makes the warm cache near-deterministic.
+# Strategy: same shape as eshop. Source comes from a host-managed checkout
+# (`checkouts/medplum/`) via BuildKit's named build context — no `git clone`
+# at build time. `npm ci` installs the full workspace deps into a baked
+# layer so warm starts have a hot node_modules.
+#
+# Build invocation (handled by harness/sandbox.py cmd_build):
+#
+#   docker buildx build \
+#       --build-context medplum-src=./checkouts/medplum \
+#       -t ai-harness/medplum:latest \
+#       images/medplum
+#
+# Medplum's repo uses npm + npm workspaces (per package.json
+# `"packageManager": "npm@10.9.8"`). NOT pnpm. The test framework is
+# jest, not vitest.
 
-ARG NODE_TAG=20-bookworm-slim
+ARG NODE_TAG=22-bookworm-slim
 FROM node:${NODE_TAG}
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        git ca-certificates curl jq tini \
+        git ca-certificates curl jq tini rsync \
         # postgres-client gives us `psql` for migrate/seed; redis-tools for ping
         postgresql-client redis-tools && \
     rm -rf /var/lib/apt/lists/*
 
-# Pin pnpm via corepack — Medplum's repo pins a specific pnpm version in
-# package.json; corepack will pick that up. Globally enable it here.
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# Pin npm via corepack — package.json sets packageManager: "npm@10.9.8".
+RUN corepack enable && corepack prepare npm@10.9.8 --activate
 
-RUN groupadd -g 1000 agent && \
-    useradd  -u 1000 -g 1000 -m -s /bin/bash agent && \
-    mkdir -p /workspace /results /opt/pnpm-store && \
-    chown -R agent:agent /workspace /results /opt/pnpm-store
+# /workspace/src and /memory pre-created as directories — see eshop
+# Dockerfile for the WSL2 cache-poisoning rationale. uid 1001 to avoid
+# collision with node:20's built-in `node` user at uid 1000.
+RUN groupadd -g 1001 agent && \
+    useradd  -u 1001 -g 1001 -m -s /bin/bash agent && \
+    mkdir -p /workspace /workspace/src /workspace/repo /memory /results /opt/npm-cache && \
+    chown -R agent:agent /workspace /memory /results /opt/npm-cache
 
-USER agent
-WORKDIR /workspace
-
-ENV PNPM_STORE_DIR=/opt/pnpm-store \
-    PNPM_HOME=/home/agent/.local/share/pnpm \
-    PATH=/home/agent/.local/share/pnpm:$PATH \
+ENV NPM_CONFIG_CACHE=/opt/npm-cache \
     CI=1
 
-ARG MEDPLUM_REF=main
-RUN git clone --depth 1 --branch "${MEDPLUM_REF}" \
-        https://github.com/medplum/medplum.git repo && \
-    cd repo && \
-    pnpm config set store-dir "${PNPM_STORE_DIR}" && \
-    # Warm the store. `--prefer-offline` later means repeat installs hit
-    # the store first.
-    pnpm install --frozen-lockfile --prefer-offline
+# Source from host build context.
+COPY --link --chown=1001:1001 --from=medplum-src . /workspace/repo
 
-COPY --chown=agent:agent runner.sh /usr/local/bin/runner.sh
-COPY --chown=agent:agent healthcheck.sh /usr/local/bin/healthcheck.sh
+USER agent
+WORKDIR /workspace/repo
+
+# `npm ci` reads package-lock.json and installs deterministically.
+# `--include=dev` keeps the dev dependencies (jest, tsx, typescript)
+# because the runner runs build + test from source inside the container.
+RUN npm ci --include=dev
+
+WORKDIR /workspace
+COPY --link --chown=1001:1001 runner.sh        /usr/local/bin/runner.sh
+COPY --link --chown=1001:1001 healthcheck.sh   /usr/local/bin/healthcheck.sh
 USER root
 RUN chmod 0755 /usr/local/bin/runner.sh /usr/local/bin/healthcheck.sh
 USER agent

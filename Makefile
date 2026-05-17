@@ -10,7 +10,8 @@ endif
 
 PROJECT ?= eshop
 
-.PHONY: help bootstrap build warmup run-build run-test run-all ps logs destroy clean nuke \
+.PHONY: help bootstrap fetch-source refresh-source build warmup run-build run-test run-all ps logs destroy clean nuke \
+        db-up db-down \
         run-task tasks-ls tasks-show tasks-memory \
         install-gvisor verify-gvisor
 
@@ -18,28 +19,47 @@ help:  ## Show this help
 	@awk 'BEGIN{FS=":.*##"; printf "\nUsage: make \033[36m<target>\033[0m\n\nTargets:\n"} \
 	      /^[a-zA-Z_-]+:.*?##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-# ── one-time bootstrap ──
+# --- one-time bootstrap ---
 
 bootstrap:  ## Generate .env (DB passwords)
 	@mkdir -p out
 	@[ -f .env ] || { \
 	    MSSQL_PW="$$(openssl rand -base64 16 | tr -d '/+=' | head -c 24)A1!"; \
-	    PG_PW="$$(openssl rand -hex 16)"; \
-	    printf 'MSSQL_SA_PASSWORD=%s\nPOSTGRES_PASSWORD=%s\n' "$$MSSQL_PW" "$$PG_PW" > .env && \
-	    echo "✓ generated .env"; \
+	    printf 'MSSQL_SA_PASSWORD=%s\nPOSTGRES_PASSWORD=medplum\n' "$$MSSQL_PW" > .env && \
+	    echo "generated .env (POSTGRES_PASSWORD=medplum to match medplum.config.json defaults)"; \
 	}
 
-# ── build sandbox images ──
+# --- source checkout (host) ---
+# Source for image builds lives at checkouts/<project>/, managed on the host.
+# `make build` auto-clones on first use; this target lets you refresh.
+
+fetch-source:    ## Clone the upstream repo to checkouts/<PROJECT>/ (no-op if exists)
+	python3 harness/sandbox.py fetch-source $(PROJECT)
+
+refresh-source:  ## git fetch + reset --hard on the existing checkout (use before rebuild after upstream changes)
+	python3 harness/sandbox.py fetch-source $(PROJECT) --refresh
+
+# --- build sandbox images ---
 
 build:  ## Build a project's sandbox image: `make build PROJECT=eshop`
 	python3 harness/sandbox.py build $(PROJECT)
 
-# ── warm baseline (one-time per image; subsequent runs restore from it) ──
+# --- warm baseline (one-time per image; subsequent runs restore from it) ---
 
 warmup:  ## Cold-start once, run prep, `docker commit` warm baselines
 	python3 harness/sandbox.py warmup $(PROJECT)
 
-# ── run a stage end-to-end ──
+# --- DB stack lifecycle (independent of workload) ---
+
+db-up:      ## Start DB stack (no-op if running): `make db-up PROJECT=eshop`
+	python3 harness/sandbox.py db-up $(PROJECT)
+
+db-down:    ## Stop DB stack (wipes data volumes)
+	python3 harness/sandbox.py db-down $(PROJECT)
+
+# --- run a stage end-to-end ---
+# `run` auto-starts the DB if it's not up. For maximum speed across many
+# iterations, do `make db-up` once, then `make run-test` repeatedly.
 
 run-build:  ## Run the build stage end-to-end: `make run-build PROJECT=eshop`
 	python3 harness/sandbox.py run $(PROJECT) build
@@ -50,7 +70,7 @@ run-test:   ## Run the test stage end-to-end (uses :warm if present)
 run-all:    ## Run build + test in one stage (no caching between)
 	python3 harness/sandbox.py run $(PROJECT) all
 
-# ── agent loop: task-scoped iterations with persistent memory ──
+# --- agent loop: task-scoped iterations with persistent memory ---
 # Usage:
 #   make run-task PROJECT=eshop TASK=fix-health SOURCE=~/work/eshop
 # Or just the task without source:
@@ -73,7 +93,7 @@ tasks-memory: ## Print the host path to a task's memory dir
 	@: $${TASK:?set TASK=<task-id>}
 	python3 harness/sandbox.py tasks memory $(PROJECT) "$$TASK"
 
-# ── inspect / debug ──
+# --- inspect / debug ---
 
 ps:         ## docker compose ps for the project
 	python3 harness/sandbox.py ps $(PROJECT)
@@ -84,7 +104,7 @@ logs:       ## docker compose logs for the project
 destroy:    ## Tear down the stack
 	python3 harness/sandbox.py destroy $(PROJECT)
 
-# ── cleanup ──
+# --- cleanup ---
 
 clean:      ## Remove generated artifacts (out/)
 	rm -rf out
@@ -97,7 +117,7 @@ nuke: clean ## Also remove warm baselines + sandbox images
 	  docker rmi ai-harness/$(PROJECT)-$$svc:warm 2>/dev/null || true; \
 	done
 
-# ── optional: gVisor kernel isolation (host setup) ──
+# --- optional: gVisor kernel isolation (host setup) ---
 
 install-gvisor:  ## Install runsc (gVisor) and register with Docker (sudo)
 	@bash scripts/install-gvisor.sh

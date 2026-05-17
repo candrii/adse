@@ -1,0 +1,60 @@
+# eShopOnWeb database stack — SQL Server only.
+#
+# Lives on its own compose project (`ai-harness-eshop-db`) so the database
+# lifecycle is independent of the workload. The agent loop pays the SQL
+# Server startup cost ONCE per session, not once per iteration.
+#
+# Workload (compose/eshop.yml) joins this network as `external: true`.
+# Bring this up before the workload:
+#
+#   docker compose -f compose/databases/eshop.yml -p ai-harness-eshop-db up -d --wait
+#   docker compose -f compose/eshop.yml -p ai-harness-eshop up -d --wait
+#
+# The CLI (`sandbox db-up`, `sandbox run`) wires the ordering automatically.
+#
+# Reset semantics:
+#   - `compose down -v` on this stack: removes SQL Server, wipes the writable
+#     layer (where /var/opt/mssql lives, since the image declares no VOLUME
+#     there) → next `up` is a true cold start.
+#   - `compose down -v` on the WORKLOAD stack: only removes egress-proxy +
+#     workload container; this DB stack keeps running with its already-warm
+#     schema-applied data. That is the optimization.
+#   - From `:warm` image (committed after a `warmup` run): SQL Server starts
+#     with `eShopOnWeb_Catalog` + `eShopOnWeb_Identity` already migrated.
+
+name: ai-harness-eshop-db
+
+services:
+  sqlserver:
+    image: ${SQLSERVER_IMAGE:-mcr.microsoft.com/mssql/server:2022-latest}
+    container_name: ai-harness-eshop-sqlserver
+    restart: "no"                       # ephemeral; CLI manages lifecycle
+    user: "0:0"                         # recent mssql/server images need root for /var/opt/mssql perms
+    environment:
+      ACCEPT_EULA:        "Y"           # headless: Microsoft requires explicit accept
+      MSSQL_SA_PASSWORD:  "${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD in .env}"
+      MSSQL_PID:          Developer
+    # /var/opt/mssql is intentionally NOT tmpfs and NOT a named volume.
+    # The mssql/server:2022-latest image declares no VOLUME there (verified
+    # via `docker image inspect ... --format='{{.Config.Volumes}}'` → map[]),
+    # so SQL Server's data files land in the container's writable layer.
+    # That layer is what `docker commit` captures into the :warm tag.
+    networks:
+      eshop-net:
+        # Stable hostname for workloads to reach this DB. The workload joins
+        # the same network and connects to `sqlserver:1433`.
+        aliases: [sqlserver]
+    healthcheck:
+      test: ["CMD-SHELL",
+             "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -No -Q 'SELECT 1' || exit 1"]
+      interval:     5s
+      timeout:      5s
+      retries:      30
+      start_period: 30s
+
+networks:
+  # Created by THIS compose stack. The workload compose declares the same
+  # network as `external: true` and joins it.
+  eshop-net:
+    name: ai-harness-eshop-net
+    driver: bridge

@@ -1,0 +1,69 @@
+# Medplum database stack — Postgres + Redis.
+#
+# Lives on its own compose project (`ai-harness-medplum-db`) so the database
+# lifecycle is independent of the workload. Same reasoning as compose/
+# databases/eshop.yml — see the header comment there.
+#
+# Bring this up before the workload:
+#
+#   docker compose -f compose/databases/medplum.yml -p ai-harness-medplum-db up -d --wait
+#   docker compose -f compose/medplum.yml -p ai-harness-medplum up -d --wait
+#
+# Postgres data lives on tmpfs (the Postgres image declares a VOLUME at
+# /var/lib/postgresql/data, so `docker commit` can't capture it; tmpfs is
+# the right pick for sub-second reset). Redis is in-memory by default.
+
+name: ai-harness-medplum-db
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: ai-harness-medplum-postgres
+    restart: "no"
+    environment:
+      POSTGRES_USER:     medplum
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+      POSTGRES_DB:       medplum
+      # PGDATA is deliberately NOT under /var/lib/postgresql/ — the postgres
+      # image declares VOLUME ["/var/lib/postgresql/data"], so anything
+      # written under the declared VOLUME would go to an anonymous Docker
+      # volume that `docker commit` can't capture. By moving PGDATA to
+      # /var/postgres-data (an undeclared path), postgres writes go to the
+      # container's writable layer. `docker commit` after a warmup-seed
+      # captures the seeded state into the `:warm` image, so the next
+      # `db-up` from `:warm` starts with `medplum_test` already populated.
+      # Same trick we used for SQL Server (which has no VOLUME at all);
+      # the only extra step here is overriding PGDATA.
+      PGDATA:            /var/postgres-data
+    volumes:
+      # Postgres runs every *.sql in /docker-entrypoint-initdb.d/ exactly
+      # once on the first start with an empty data dir. We use it to
+      # provision the medplum_test DB that loadTestConfig expects.
+      - ./medplum-postgres-init.sql:/docker-entrypoint-initdb.d/00-medplum-test.sql:ro
+    networks:
+      medplum-net:
+        aliases: [postgres]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medplum -d medplum"]
+      interval: 3s
+      timeout:  3s
+      retries:  20
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: ai-harness-medplum-redis
+    restart: "no"
+    command: redis-server --save "" --appendonly no    # ephemeral, no persistence
+    networks:
+      medplum-net:
+        aliases: [redis]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout:  3s
+      retries:  10
+
+networks:
+  medplum-net:
+    name: ai-harness-medplum-net
+    driver: bridge

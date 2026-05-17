@@ -1,6 +1,7 @@
 .env
 .secrets/
 out/
+checkouts/
 __pycache__/
 *.pyc
 .venv/
