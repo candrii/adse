@@ -1,0 +1,159 @@
+# eShopOnWeb sandbox profile.
+#
+# A self-contained stack — its own SQL Server, its own sandbox container,
+# its own network namespace. No cross-project services, no orchestration
+# tier. The headless-agent harness (or a CI runner, or you) submits work
+# via `docker compose exec` against this stack.
+#
+# Bring up:    docker compose -f compose/eshop.yml up -d
+# Submit work: docker compose -f compose/eshop.yml exec eshop /usr/local/bin/runner.sh test
+# Reset:       docker compose -f compose/eshop.yml down -v
+#
+# Snapshot baseline:
+#   1. compose up; runner.sh build; runner.sh migrate
+#   2. docker commit ai-harness-eshop-sqlserver  ai-harness/sqlserver-eshop:warm
+#   3. docker commit ai-harness-eshop            ai-harness/eshop:warm
+#   4. compose down; subsequent up uses the :warm tags via `harness/sandbox.py run --snapshot warm`
+#
+# Headless requirements:
+#   - SQL Server: ACCEPT_EULA=Y env (Microsoft requires explicit accept)
+#   - eShop:      no interactive prompts; EF migrate runs via dotnet ef CLI
+
+name: eshop
+
+x-restart: &restart-policy
+  restart: "no"   # ephemeral by design — don't auto-restart crashed containers
+
+services:
+  sqlserver:
+    image: ${SQLSERVER_IMAGE:-mcr.microsoft.com/mssql/server:2022-latest}
+    container_name: ai-harness-eshop-sqlserver
+    <<: *restart-policy
+    user: "0:0"                       # recent mssql/server images choke on tmpfs as the `mssql` user
+    environment:
+      ACCEPT_EULA:        "Y"                 # headless: Microsoft requires explicit accept
+      MSSQL_SA_PASSWORD:  "${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD in .env}"
+      MSSQL_PID:          Developer
+    tmpfs:
+      # data on tmpfs → fast `docker compose down -v` reset, no leakage between runs
+      - /var/opt/mssql:size=4g
+    networks: [eshop-net]
+    deploy:
+      resources:
+        limits:
+          cpus:   "2"
+          memory: 4G                   # SQL Server's documented minimum
+    healthcheck:
+      test: ["CMD-SHELL",
+             "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -No -Q 'SELECT 1' || exit 1"]
+      interval:     5s
+      timeout:      5s
+      retries:      30
+      start_period: 30s
+
+  # ───────────────────────── egress allowlist ─────────────────────────
+  # tinyproxy with an FQDN allowlist. The eshop service has HTTP_PROXY /
+  # HTTPS_PROXY set so any *outbound* traffic from agent-generated code
+  # (curl, git, dotnet restore for unbacked packages, etc.) is filtered.
+  # `NO_PROXY` covers in-network hostnames so DB traffic stays direct.
+  # Default-deny: anything not on egress-proxy/allowlist.txt is dropped.
+  egress-proxy:
+    build:
+      context: ../egress-proxy
+    image: ai-harness/egress-proxy:latest
+    container_name: ai-harness-eshop-egress
+    <<: *restart-policy
+    networks: [eshop-net]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 128M }
+
+  eshop:
+    image: ${ESHOP_IMAGE:-ai-harness/eshop:latest}
+    container_name: ai-harness-eshop
+    <<: *restart-policy
+    depends_on:
+      sqlserver: { condition: service_healthy }
+      egress-proxy: { condition: service_started }
+    # ── Isolation ─────────────────────────────────────────────────────
+    # Drop ALL Linux capabilities; the workload only needs to read/write
+    # the workspace + exec dotnet, neither of which needs CAP_*.
+    # `no-new-privileges` blocks any in-container `setuid` escalation.
+    # Drop the dangerous-but-rarely-needed capabilities. Keeping `cap_drop: ALL`
+    # blanket would also strip CAP_FOWNER / CAP_DAC_OVERRIDE / CAP_CHOWN,
+    # which the workload root needs to manage the image's /workspace/repo
+    # (baked as uid 1001 `agent`). The list below is the standard
+    # "Docker-default + a few extras" — blocks kernel ops, raw network,
+    # ptrace, time changes, audit, etc.
+    cap_drop:
+      - AUDIT_WRITE
+      - MKNOD
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+      - SYS_MODULE
+      - SYS_PTRACE
+      - SYS_TIME
+      - SYS_TTY_CONFIG
+    security_opt:
+      - no-new-privileges:true
+    # WSL2 Docker Desktop doesn't propagate host bind-mount perms; root
+    # in the workload is a deliberate trade — single-tenant container on
+    # its own network namespace, no kernel caps, no-new-privileges, plus
+    # optional gVisor (`runtime: runsc`) for kernel isolation. See README.
+    user: "0:0"
+    environment:
+      # Connection info passed to runner.sh; the eshop image's
+      # Program.cs reads ConnectionStrings__* from environment.
+      SQL_HOST:           sqlserver
+      MSSQL_SA_PASSWORD:  "${MSSQL_SA_PASSWORD}"
+      # Surface the task identifier so runner.sh can record it in
+      # result.json and the agent can introspect from inside.
+      TASK_ID:            "${TASK_ID:-}"
+      # NOTE: HTTP_PROXY / HTTPS_PROXY are deliberately NOT set here.
+      # `egress-proxy` is available on this network (and the allowlist is
+      # the right policy) but a plain HTTP proxy can only filter traffic
+      # that *opts in* via the proxy env vars — the container's network
+      # namespace still has unrestricted direct egress. Setting the env
+      # also broke LibMan's HTTPS-via-proxy negotiation. For real egress
+      # control we'd need netns iptables rules or k8s NetworkPolicy.
+      # See README "Egress allowlist (caveat)" for the full story.
+      # The image's runner.sh subcommand is invoked via `docker compose exec`
+      # at task time; the entrypoint here is just `sleep infinity` (tini).
+    tmpfs:
+      # /workspace is intentionally NOT tmpfs — it shadows the image's
+      # baked /workspace/repo clone. The container's writable layer holds
+      # any in-run edits, and `compose down -v` discards it cleanly.
+      - /tmp:size=512m
+    volumes:
+      # All paths are absolute — set by the CLI (`sandbox.py`) at compose-up
+      # time. Compose resolves relative paths against the *compose file's*
+      # directory (not the CWD), which silently mounts the wrong location.
+      #
+      # /results        per-run output dir; runner.sh writes result.json + logs
+      # /workspace/src  optional read-only source override; runner.sh copies
+      #                 it onto /workspace/repo at startup. The CLI passes
+      #                 /dev/null when --source isn't set — runner.sh's
+      #                 `[ -d /workspace/src ]` test is then false and the
+      #                 image's baked /workspace/repo is used.
+      # /memory         optional persistent agent scratchpad scoped to a
+      #                 task_id. Survives `compose down -v` (it's a host
+      #                 bind mount). /dev/null when --task isn't set.
+      - "${RESULTS_DIR:?CLI must set RESULTS_DIR to an absolute host path}:/results"
+      - "${SOURCE_DIR:-/dev/null}:/workspace/src:ro"
+      - "${MEMORY_DIR:-/dev/null}:/memory:rw"
+    networks: [eshop-net]
+    deploy:
+      resources:
+        limits:
+          cpus:   "2"
+          memory: 4G
+    # Default cmd is sleep infinity (from the image's tini ENTRYPOINT) so
+    # the caller can `docker compose exec` arbitrary work into it.
+
+networks:
+  # Unique network per project — no accidental cross-talk between an eshop
+  # run and a medplum run on the same host.
+  eshop-net:
+    name: ai-harness-eshop-net
+    driver: bridge

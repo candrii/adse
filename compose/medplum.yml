@@ -1,0 +1,110 @@
+# Medplum sandbox profile.
+#
+# Self-contained stack: Postgres + Redis + Medplum sandbox. Mirrors the
+# eshop profile's shape — same lifecycle conventions (compose up → exec
+# work → snapshot or down -v), per-project isolated network.
+#
+# Bring up:    docker compose -f compose/medplum.yml up -d
+# Submit work: docker compose -f compose/medplum.yml exec medplum /usr/local/bin/runner.sh test
+# Reset:       docker compose -f compose/medplum.yml down -v
+
+name: medplum
+
+x-restart: &restart-policy
+  restart: "no"
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: ai-harness-medplum-postgres
+    <<: *restart-policy
+    environment:
+      POSTGRES_USER:     medplum
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+      POSTGRES_DB:       medplum
+    tmpfs:
+      - /var/lib/postgresql/data:size=2g
+    networks: [medplum-net]
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medplum -d medplum"]
+      interval: 3s
+      timeout:  3s
+      retries:  20
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: ai-harness-medplum-redis
+    <<: *restart-policy
+    command: redis-server --save "" --appendonly no    # ephemeral, no persistence
+    networks: [medplum-net]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout:  3s
+      retries:  10
+
+  # Per-project egress allowlist — same shape as compose/eshop.yml.
+  egress-proxy:
+    build:
+      context: ../egress-proxy
+    image: ai-harness/egress-proxy:latest
+    container_name: ai-harness-medplum-egress
+    <<: *restart-policy
+    networks: [medplum-net]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 128M }
+
+  medplum:
+    image: ${MEDPLUM_IMAGE:-ai-harness/medplum:latest}
+    container_name: ai-harness-medplum
+    <<: *restart-policy
+    depends_on:
+      postgres:     { condition: service_healthy }
+      redis:        { condition: service_healthy }
+      egress-proxy: { condition: service_started }
+    # See compose/eshop.yml for the isolation contract — same rationale.
+    # See compose/eshop.yml for the rationale — same drop list.
+    cap_drop:
+      - AUDIT_WRITE
+      - MKNOD
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+      - SYS_MODULE
+      - SYS_PTRACE
+      - SYS_TIME
+      - SYS_TTY_CONFIG
+    security_opt:
+      - no-new-privileges:true
+    user: "0:0"
+    environment:
+      PG_HOST:           postgres
+      REDIS_HOST:        redis
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      TASK_ID:           "${TASK_ID:-}"
+      # HTTP_PROXY env intentionally not set — see compose/eshop.yml for
+      # the egress-enforcement caveat. egress-proxy stays declared as the
+      # intended policy surface and for any opt-in tooling.
+    tmpfs:
+      - /tmp:size=512m
+    volumes:
+      # See compose/eshop.yml for the full mount contract — same shape here.
+      - "${RESULTS_DIR:?CLI must set RESULTS_DIR}:/results"
+      - "${SOURCE_DIR:-/dev/null}:/workspace/src:ro"
+      - "${MEMORY_DIR:-/dev/null}:/memory:rw"
+    networks: [medplum-net]
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }
+
+networks:
+  medplum-net:
+    name: ai-harness-medplum-net
+    driver: bridge

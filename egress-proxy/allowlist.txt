@@ -1,0 +1,39 @@
+# Egress allowlist for AI agent sandboxes.
+# Anything not matching one of these patterns is dropped.
+# Patterns are POSIX extended regex, matched against the request host.
+#
+# Add carefully — every entry widens what agent-generated code can reach.
+
+# ─── source code ───
+^github\.com$
+^.*\.github\.com$
+^codeload\.github\.com$
+^objects\.githubusercontent\.com$
+^raw\.githubusercontent\.com$
+
+# ─── .NET / NuGet ───
+^api\.nuget\.org$
+^.*\.nuget\.org$
+
+# ─── LibMan client-side libraries (eShop) ───
+# Microsoft's LibMan tool fetches jquery / bootstrap / etc. from cdnjs at
+# build time. Without this, eShop's `dotnet build` fails with LIB002.
+^cdnjs\.cloudflare\.com$
+^cdn\.jsdelivr\.net$
+
+# ─── Node / pnpm ───
+^registry\.npmjs\.org$
+^registry\.yarnpkg\.com$
+
+# ─── Microsoft Container Registry (SQL Server, dotnet images) ───
+^mcr\.microsoft\.com$
+^.*\.data\.mcr\.microsoft\.com$
+
+# ─── Docker Hub (postgres, redis, alpine) ───
+^registry-1\.docker\.io$
+^auth\.docker\.io$
+^production\.cloudflare\.docker\.com$
+
+# ─── Medplum-specific ───
+^app\.medplum\.com$
+^api\.medplum\.com$

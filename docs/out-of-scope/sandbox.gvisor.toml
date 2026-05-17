@@ -1,0 +1,54 @@
+# OpenSandbox server config — gVisor (advanced) overlay.
+#
+# Same as sandbox.toml but flips the Docker runtime for spawned sandboxes
+# to `runsc`. The Compose control-plane services are unaffected — gVisor
+# only applies to containers OpenSandbox creates via the Docker socket.
+#
+# Prereq: `make install-gvisor` && `make verify-gvisor` both green.
+# Use via: `make up-secure` (sets SANDBOX_CONFIG to this file).
+
+[server]
+host = "0.0.0.0"
+port = 8080
+max_sandbox_timeout_seconds = 86400
+
+[log]
+level = "INFO"
+
+[runtime]
+type        = "docker"
+execd_image = "opensandbox/execd:v1.0.14"
+
+[storage]
+allowed_host_paths = []
+volume_default_size = "1Gi"
+
+[store]
+type = "sqlite"
+path = "/var/lib/opensandbox/opensandbox.db"
+
+[docker]
+# ─── the line that matters ───
+# Picks the Docker runtime per `docker run --runtime=...`. Host must have
+# `runsc` registered (scripts/install-gvisor.sh + scripts/verify-gvisor.sh).
+runtime = "runsc"
+
+network_mode = "ai-harness-net"
+drop_capabilities = [
+  "AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW",
+  "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG",
+]
+no_new_privileges = true
+pids_limit        = 512
+apparmor_profile  = ""
+seccomp_profile   = ""
+
+[ingress]
+mode = "direct"
+
+[egress]
+image = "opensandbox/egress:v1.0.10"
+mode  = "direct"
+
+[renew_intent]
+enabled = false

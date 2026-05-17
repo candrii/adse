@@ -1,0 +1,3 @@
+# harness/sandbox.py uses only the stdlib + the `docker` CLI, no pip deps.
+# This file is kept for tooling that expects `requirements.txt` but is
+# intentionally empty.

@@ -1,0 +1,14 @@
+.env
+.secrets/
+out/
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+
+# Interview brief — not for distribution
+docs/TASK_TEXT.md
+docs/Developer Sandbox - Candidate Brief.pdf
+docs/*Candidate*Brief*
+

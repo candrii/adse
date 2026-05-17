@@ -1,0 +1,64 @@
+# OpenSandbox server config — laptop / Compose mode (runc runtime).
+#
+# Generated against the canonical schema (opensandbox-server 0.1.13). Full
+# reference: https://github.com/alibaba/OpenSandbox/blob/main/server/configuration.md
+#
+# Per-sandbox concerns (env, limits, tmpfs, image allowlist) are passed by
+# the caller on `POST /v1/sandboxes` — the harness CLI handles that. This
+# file only configures the *server* itself.
+
+[server]
+host = "0.0.0.0"
+port = 8080
+max_sandbox_timeout_seconds = 86400
+# Empty api_key + OPENSANDBOX_INSECURE_SERVER=YES env = demo mode. For
+# production, set api_key here (or template it in from the bootstrap script)
+# and drop the env var.
+
+[log]
+level = "INFO"
+
+[runtime]
+type        = "docker"
+execd_image = "opensandbox/execd:v1.0.14"   # injected into every sandbox; pulled on first use
+
+[storage]
+# No host paths are allowed for bind-mount into sandboxes. Workspace +
+# results are tmpfs allocated per-task by the harness.
+allowed_host_paths = []
+volume_default_size = "1Gi"
+
+[store]
+# Where the server keeps its sandbox metadata (sqlite). Lives in the named
+# volume `sandbox-state` so it survives compose restarts.
+type = "sqlite"
+path = "/var/lib/opensandbox/opensandbox.db"
+
+[docker]
+# Sandbox containers attach to this network so they can dial
+# sqlserver/postgres/redis/egress-proxy by hostname.
+network_mode = "ai-harness-net"
+
+# Drop everything dangerous; agent code never needs these.
+drop_capabilities = [
+  "AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW",
+  "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG",
+]
+no_new_privileges = true
+pids_limit        = 512
+# AppArmor profile name (set to "docker-default" if AppArmor is enabled on the host)
+apparmor_profile = ""
+# Empty = Docker default seccomp profile; agent code is fine under it
+seccomp_profile  = ""
+
+[ingress]
+# Sandboxes are reachable directly on the compose network (no gateway).
+mode = "direct"
+
+# [egress] section omitted — see if defaults work; we have our own
+# tinyproxy-based egress allowlist in front of sandboxes anyway. If
+# OpenSandbox requires egress, set mode = "dns" and it'll pull
+# opensandbox/egress:v1.0.10 on first sandbox creation.
+
+[renew_intent]
+enabled = false

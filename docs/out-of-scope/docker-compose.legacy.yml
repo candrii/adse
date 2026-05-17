@@ -1,0 +1,262 @@
+name: ai-harness
+
+# Control plane + shared services for the AI agent sandbox.
+#
+# OpenSandbox-server is the sandbox API gateway. The harness CLI calls its REST
+# API (`POST /v1/sandboxes`, etc.) to spawn per-task containers. Those containers
+# attach to this same Docker network so they can reach the DB sidecars below.
+#
+# Databases are shared across runs intentionally — they're recreated/migrated
+# per task, but we don't pay startup cost on every agent invocation. Per-task
+# schema isolation is handled by the runner (`runner.sh` creates and drops a
+# database named after the task ID).
+
+x-restart-policy: &restart-policy
+  restart: unless-stopped
+
+services:
+  # ───────────────────────────── control plane ─────────────────────────────
+  opensandbox:
+    build:
+      context: ./images/opensandbox-server
+      args:
+        OPENSANDBOX_SERVER_VERSION: "0.1.13"
+    image: ai-harness/opensandbox-server:0.1.13
+    container_name: ai-harness-opensandbox
+    <<: *restart-policy
+    ports:
+      - "127.0.0.1:8080:8080"          # bind to loopback only
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # SANDBOX_CONFIG selects which TOML mounts in. Default = runc (laptop
+      # mode). Set `SANDBOX_CONFIG=./sandbox.gvisor.toml` (or use
+      # `make up-secure`) to spawn sandboxes under gVisor instead.
+      - ${SANDBOX_CONFIG:-./sandbox.toml}:/etc/opensandbox/sandbox.toml:ro
+      - sandbox-state:/var/lib/opensandbox
+    environment:
+      # api_key is left empty in the TOML for the demo. This env var
+      # acknowledges the insecure-no-key boot; replace with a real key
+      # before exposing the API beyond localhost.
+      OPENSANDBOX_INSECURE_SERVER: "YES"
+    networks:
+      - sandbox-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ─────────────────────────── egress allowlist ───────────────────────────
+  # Sandboxes route outbound HTTP(S) through this proxy. The proxy whitelists
+  # only the registries we need (github, nuget, npm, mcr) and blocks all other
+  # traffic by default. This is the primary defense against prompt-injected
+  # exfiltration in agent-generated code.
+  egress-proxy:
+    build: ./egress-proxy
+    container_name: ai-harness-egress
+    <<: *restart-policy
+    networks:
+      - sandbox-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8888/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ──────────────────────────────── databases ────────────────────────────────
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: ai-harness-sqlserver
+    <<: *restart-policy
+    # Recent mssql/server images default to user `mssql` (uid 10001) which
+    # can't create the `/.system` directory on a fresh tmpfs. Running as
+    # root inside the container is safe here — the network is internal-only
+    # and the data volume is tmpfs-isolated.
+    user: "0:0"
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD in .env}"
+      MSSQL_PID: Developer
+    # data on tmpfs → sub-second per-task reset, no leakage between runs
+    tmpfs:
+      - /var/opt/mssql:size=4g
+    networks:
+      sandbox-net:
+        aliases: [sqlserver]
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -No -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-harness-postgres
+    <<: *restart-policy
+    environment:
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+      POSTGRES_USER: medplum
+      POSTGRES_DB: medplum
+    tmpfs:
+      - /var/lib/postgresql/data:size=2g
+    networks:
+      sandbox-net:
+        aliases: [postgres]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medplum -d medplum"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-harness-redis
+    <<: *restart-policy
+    command: redis-server --save "" --appendonly no   # ephemeral
+    networks:
+      sandbox-net:
+        aliases: [redis]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─────────────────────── runtime manager ───────────────────────
+  # HTTP service that sits above OpenSandbox and exposes higher-level
+  # environment operations (build, migrate, wait_healthy, tests, reset,
+  # warm-pool lease, sidecar attach). Temporal activities call this
+  # rather than OpenSandbox directly.
+
+  runtime-manager:
+    build:
+      context: .
+      dockerfile: images/runtime-manager/Dockerfile
+    image: ai-harness/runtime-manager:latest
+    container_name: ai-harness-runtime-manager
+    <<: *restart-policy
+    depends_on:
+      opensandbox:
+        condition: service_started
+    environment:
+      OPENSANDBOX_API:            http://opensandbox:8080
+      AI_HARNESS_INSIDE_COMPOSE:  "1"
+      LOG_LEVEL:                  INFO
+      # Forwarded from host env at compose-up time so per-project handlers
+      # can construct connection strings to the shared sidecar DBs.
+      MSSQL_SA_PASSWORD:          "${MSSQL_SA_PASSWORD:-}"
+      POSTGRES_PASSWORD:          "${POSTGRES_PASSWORD:-}"
+    ports:
+      - "127.0.0.1:8090:8090"        # loopback only
+    networks: [sandbox-net]
+
+  # ─────────────────────── orchestration layer ───────────────────────
+  # Temporal sits in front of OpenSandbox. Workflows + activities here own
+  # *when* and *what-order*; OpenSandbox owns *where* and *how-isolated*.
+  # The agent-worker is the bridge — Python process that polls Temporal,
+  # calls OpenSandbox via REST, and reports results.
+
+  temporal-postgres:
+    image: postgres:13
+    container_name: ai-harness-temporal-postgres
+    <<: *restart-policy
+    environment:
+      POSTGRES_USER:     temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB:       temporal
+    tmpfs:
+      - /var/lib/postgresql/data:size=2g
+    networks: [sandbox-net]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "temporal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.27.2
+    container_name: ai-harness-temporal
+    <<: *restart-policy
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+    environment:
+      DB:              postgres12
+      DB_PORT:         "5432"
+      POSTGRES_USER:   temporal
+      POSTGRES_PWD:    temporal
+      POSTGRES_SEEDS:  temporal-postgres
+      LOG_LEVEL:       warn
+    ports:
+      - "127.0.0.1:7233:7233"          # gRPC frontend (SDK clients connect here)
+    networks: [sandbox-net]
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  temporal-ui:
+    image: temporalio/ui:2.32.0
+    container_name: ai-harness-temporal-ui
+    <<: *restart-policy
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS:      temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "127.0.0.1:8233:8080"          # web UI (avoid :8080 collision with opensandbox)
+    networks: [sandbox-net]
+
+  agent-worker:
+    build:
+      context: .
+      dockerfile: images/temporal-worker/Dockerfile
+    image: ai-harness/temporal-worker:latest
+    <<: *restart-policy
+    depends_on:
+      temporal:
+        condition: service_healthy
+      opensandbox:
+        condition: service_started
+    environment:
+      TEMPORAL_ADDRESS:           temporal:7233
+      TEMPORAL_NAMESPACE:         default
+      OPENSANDBOX_API:            http://opensandbox:8080
+      # WSL2's Docker port forwarder bottlenecks above ~4 simultaneous
+      # container starts. Lower this on WSL2; raise to 8+ on native Linux
+      # or when running on k8s (which doesn't host-publish sandbox ports).
+      MAX_CONCURRENT_ACTIVITIES:  "2"
+      MAX_CONCURRENT_WORKFLOWS:   "4"
+      AI_HARNESS_INSIDE_COMPOSE:  "1"
+      LOG_LEVEL:                  INFO
+    deploy:
+      replicas: 2                       # scale at runtime: docker compose up --scale agent-worker=N
+    networks: [sandbox-net]
+
+networks:
+  sandbox-net:
+    name: ai-harness-net
+    driver: bridge
+
+volumes:
+  sandbox-state:
