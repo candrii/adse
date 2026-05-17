@@ -10,19 +10,24 @@ explicitly marked "Not implemented".
 One sandbox per application. Each application is split across TWO compose
 files with independent lifecycles:
 
-- compose/databases/<project>.yml - long-lived DB stack. Owns the network.
-  Started once per agent session.
-- compose/<project>.yml           - ephemeral workload stack. Joins the
-  DB's network as `external: true`. Created + destroyed per iteration.
+```
+compose/databases/<project>.yml   long-lived DB stack. Owns the network.
+                                  Started once per agent session.
+compose/<project>.yml             ephemeral workload stack. Joins the
+                                  DB's network as `external: true`.
+                                  Created + destroyed per iteration.
+```
 
 Per-project network namespace; zero cross-talk between an eshop run and a
 medplum run on the same host. Same shape (compose pair + image +
 runner.sh + result.json) generalises to any new app.
 
-- compose/databases/eshop.yml     - SQL Server                              (network: ai-harness-eshop-net)
-- compose/eshop.yml               - eshop workload + egress-proxy           (joins ai-harness-eshop-net)
-- compose/databases/medplum.yml   - Postgres + Redis                        (network: ai-harness-medplum-net)
-- compose/medplum.yml             - medplum workload + egress-proxy         (joins ai-harness-medplum-net)
+```
+compose/databases/eshop.yml     SQL Server                          (network: ai-harness-eshop-net)
+compose/eshop.yml               eshop workload + egress-proxy       (joins ai-harness-eshop-net)
+compose/databases/medplum.yml   Postgres + Redis                    (network: ai-harness-medplum-net)
+compose/medplum.yml             medplum workload + egress-proxy     (joins ai-harness-medplum-net)
+```
 
 Why split? The agent loop pays the database startup cost (SQL Server boot
 + healthcheck wait ~5-8s) ONCE per session, not once per iteration. See Q5.
@@ -151,19 +156,29 @@ results, prior reasoning notes, the diff that was tried last.
 
 Implementation: filesystem, anchored by a task identifier (`--task <id>`).
 
-- out/<project>/<task>/memory/        - bind-mounted into the sandbox as
-                                        /memory. Agent-writable scratchpad,
-                                        survives `compose down -v`.
-- out/<project>/<task>/iterations.jsonl - append-only iteration log
-                                          (run_id, stage, exit_code,
-                                          duration, source_dir, db_was_up).
-- out/<project>/<task>/<run_id>/      - full per-iteration artifacts
-                                        (result.json, .trx, app.log, stage
-                                        logs).
-- `harness/sandbox.py tasks ls|show|memory` - CLI for inspecting iteration
-                                              history.
+```
+out/<project>/<task>/memory/          bind-mounted into the sandbox as
+                                      /memory. Agent-writable scratchpad,
+                                      survives `compose down -v`.
+out/<project>/<task>/iterations.jsonl append-only iteration log
+                                      (run_id, stage, exit_code,
+                                      duration, source_dir, db_was_up).
+out/<project>/<task>/<run_id>/        full per-iteration artifacts
+                                      (result.json, .trx, app.log, stage
+                                      logs). run_id format:
+                                      2026-05-17T01-14-53-test-434b1e
+                                      so dirs sort chronologically.
+```
 
-Wired up in harness/sandbox.py cmd_run and the `tasks` subcommand group.
+CLI for inspecting iteration history:
+
+```
+harness/sandbox.py tasks ls
+harness/sandbox.py tasks show <project> <task-id>
+harness/sandbox.py tasks memory <project> <task-id>
+```
+
+Wired up in `harness/sandbox.py cmd_run` and the `tasks` subcommand group.
 
 
 ## 5. intra
@@ -190,7 +205,7 @@ Currently implemented in this repo:
   workload container. SQL Server's schema state (in the writable layer
   because the image declares no VOLUME) AND the workload's `bin/obj` tree
   travel with the snapshot.
-- Independent DB lifecycle (compose/databases/<project>.yml + workload
+- Independent DB lifecycle (`compose/databases/<project>.yml` + workload
   joins as `external` network). DB stays up across iterations; only
   workload restarts.
 - NuGet / pnpm warm caches baked into image layers (images/*/Dockerfile).
@@ -286,7 +301,7 @@ What is implemented:
   30=migrate_fail, 40=health_fail, 50=timeout, 60=infra, 70=patch_fail,
   80=checkout_fail
 - Per-stage logs (restore.log, build.log, migrate.log, app.log, test.log,
-  run.log) bind-mounted to the host at out/<project>/[<task>/]<run_id>/
+  run.log) bind-mounted to the host at `out/<project>/[<task>/]<run_id>/`
 - dotnet test --logger trx - TRX (structured XML) parseable downstream
   (images/eshop/runner.sh `do_test` function)
 - Per-iteration `db_was_up` field in iterations.jsonl so the agent can
