@@ -116,20 +116,104 @@ No top-level `docker-compose.yml`. Per-project profiles are the unit of isolatio
 
 ## Quickstart
 
-```bash
-make bootstrap                      # write .env (DB passwords)
-make build PROJECT=eshop            # auto-clones source to checkouts/eshop/,
-                                    # then docker buildx build :latest
-make warmup PROJECT=eshop           # cold-up DB + workload, commit :warm
-make db-up PROJECT=eshop            # start the long-lived DB stack
-make run-test PROJECT=eshop         # warm workload run; DB stays up
-make run-test PROJECT=eshop         # next iteration; ~42s
-make destroy PROJECT=eshop          # tear down everything (DB + workload)
+### Prerequisites
 
-# Update source without rebuilding the image:
-make refresh-source PROJECT=eshop   # git fetch + reset --hard on checkouts/
-# Source changes can be applied at run time via --source instead — no rebuild
+- Docker Desktop (WSL2 backend) or native Docker, with `docker compose`
+- Python 3 on PATH (the harness is a thin wrapper over `docker buildx` + `docker compose`)
+- ~10 GB free disk (eshop's `:latest` image is ~5.4 GB; `:warm` adds a few hundred MB)
+- `git`, `openssl`, `make`
+- Internet access for the first build (NuGet/npm warm + base image pulls)
+
+```bash
+docker version && docker compose version && python3 --version
 ```
+
+### Step 1 — Generate DB passwords (once per checkout)
+
+```bash
+make bootstrap
+```
+
+Writes `.env` with `MSSQL_SA_PASSWORD` (random) and `POSTGRES_PASSWORD=medplum`. Re-running is a no-op. `.env` is gitignored.
+
+### Step 2 — Build the sandbox image (~minutes, once per project or after image changes)
+
+```bash
+make build PROJECT=eshop
+```
+
+What happens:
+- Clones `github.com/NimblePros/eShopOnWeb` into `checkouts/eshop/` if it's missing
+- `docker buildx build` produces `ai-harness-eshop:latest` (.NET 10 SDK + warm NuGet)
+
+Swap `PROJECT=medplum` to build the Node 22 stack instead.
+
+### Step 3 — Warm up (once per image, ~70s for eshop)
+
+```bash
+make warmup PROJECT=eshop
+```
+
+Cold-starts DB + workload one time, runs EF migrations + `dotnet build`, then `docker commit`s the result into `:warm` tags. Future runs restore from `:warm` instead of paying restore+build+migrate again.
+
+### Step 4 — Start the long-lived DB (~6s)
+
+```bash
+make db-up PROJECT=eshop
+```
+
+DB stack stays up across iterations. Saves ~8s per iteration vs. cold-booting SQL Server every run.
+
+### Step 5 — Run tests (your inner loop)
+
+```bash
+make run-test PROJECT=eshop          # full suite (113 tests), ~29s
+```
+
+Iterate as many times as you want — DB stays up. Results land under `out/eshop/<task-id>/<run-id>/result.json`.
+
+Faster inner loop with a test filter (~16s):
+
+```bash
+python3 harness/sandbox.py run eshop test --filter "FullyQualifiedName~BasketServiceTests"
+```
+
+### Step 6 — Iterate on host-side edits (incremental)
+
+```bash
+make run-task PROJECT=eshop TASK=fix-health SOURCE=~/work/eshop
+# edit ~/work/eshop/src/Web/Program.cs
+make run-task PROJECT=eshop TASK=fix-health SOURCE=~/work/eshop   # rsync overlay, ~30-38s
+make tasks-show PROJECT=eshop TASK=fix-health                     # iteration history
+```
+
+`--source` rsyncs your edits over the warm tree (preserving `bin/obj/.git`) so `dotnet build` only recompiles changed files. `iterations.jsonl` and `memory/` persist across runs for the same `TASK`.
+
+### Step 7 — Tear down at end of session
+
+```bash
+make destroy PROJECT=eshop           # workload + DB both stopped, volumes wiped
+```
+
+Between sessions you can also `make db-down` alone to wipe DB state without losing the `:warm` image.
+
+### Common follow-ups
+
+| You want to… | Command |
+|---|---|
+| Refresh upstream source without rebuilding the image | `make refresh-source PROJECT=eshop` |
+| See what's running | `make ps PROJECT=eshop` |
+| Tail logs | `make logs PROJECT=eshop` |
+| Drop into the sandbox | `python3 harness/sandbox.py exec eshop -- bash` |
+| Start over from scratch | `make nuke` (removes images too) |
+| List all tasks | `make tasks-ls` |
+
+### Troubleshooting
+
+- **`make build` fails on first run** — check `docker buildx version`; ensure Docker Desktop has ≥8 GB RAM allocated.
+- **`make warmup` times out on SQL Server** — give Docker more memory; SQL Server needs ~2 GB just to boot.
+- **`not a directory` on run** — a stale warm image baked `/memory` or `/workspace/src` as a file. Fix: `make nuke && make build && make warmup`.
+- **Tests see stale DB state across iterations** — expected with the long-lived DB. Either write idempotent tests or `make db-down && make db-up` between iterations (loses the ~8s DB-warm speedup).
 
 ## Agent loop — task-scoped iteration
 
